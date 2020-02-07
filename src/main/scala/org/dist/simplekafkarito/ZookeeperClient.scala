@@ -1,5 +1,6 @@
 package org.dist.simplekafkarito
 
+import com.fasterxml.jackson.core.`type`.TypeReference
 import com.google.common.annotations.VisibleForTesting
 import org.I0Itec.zkclient.exception.ZkNoNodeException
 import org.I0Itec.zkclient.{IZkChildListener, ZkClient}
@@ -17,9 +18,13 @@ trait ZookeeperClient {
 
   def subscribeBrokerChangeListener(listener: IZkChildListener): Option[List[String]]
 
+  def getPartitionAssignmentsFor(topicName: String): List[PartitionReplicas]
+
   def getBrokerInfo(brokerId: Int): Broker
 
   def setPartitionReplicasForTopic(topicName: String, partitionReplicas: Set[PartitionReplicas])
+
+  def subscribeTopicChangeListener(listener: IZkChildListener): Option[List[String]]
 }
 
 case class ControllerExistsException(controllerId: String) extends RuntimeException
@@ -97,5 +102,15 @@ private[simplekafkarito] class ZookeeperClientRitoImpl(config: Config) extends Z
   def subscribeBrokerChangeListener(listener: IZkChildListener): Option[List[String]] = {
     val result = zkClient.subscribeChildChanges(BrokerIdsPath, listener)
     Option(result).map(_.asScala.toList)
+  }
+
+  def subscribeTopicChangeListener(listener: IZkChildListener): Option[List[String]] = {
+    val result = zkClient.subscribeChildChanges(BrokerTopicsPath, listener)
+    Option(result).map(_.asScala.toList)
+  }
+
+  override def getPartitionAssignmentsFor(topicName: String): List[PartitionReplicas] = {
+    val partitionAssignments: String = zkClient.readData(getTopicPath(topicName))
+    JsonSerDes.deserialize[List[PartitionReplicas]](partitionAssignments.getBytes, new TypeReference[List[PartitionReplicas]]() {})
   }
 }

@@ -21,6 +21,10 @@ class TestZookeeperClient(brokerIds: List[Int]) extends ZookeeperClient {
     this.topicName = topicName
     this.partitionReplicas = partitionReplicas
   }
+
+  override def getPartitionAssignmentsFor(topicName: String): List[PartitionReplicas] = ???
+
+  override def subscribeTopicChangeListener(listener: IZkChildListener): Option[List[String]] = ???
 }
 
 class CreateTopicCommandTest extends ZookeeperTestHarness {
