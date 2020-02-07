@@ -38,7 +38,7 @@ class Controller(val zookeeperClient: ZookeeperClient, val brokerId: Int, socket
   def onBecomingLeader() = {
     liveBrokers = liveBrokers ++ zookeeperClient.getAllBrokers()
     zookeeperClient.subscribeTopicChangeListener(new TopicChangeHandler(zookeeperClient, onTopicChange))
-    zookeeperClient.subscribeBrokerChangeListener(new BrokerChangeListener(zookeeperClient))
+    zookeeperClient.subscribeBrokerChangeListener(new BrokerChangeListener(this, zookeeperClient))
   }
 
   def onTopicChange(topicName: String, partitionReplicas: Seq[PartitionReplicas]) = {
