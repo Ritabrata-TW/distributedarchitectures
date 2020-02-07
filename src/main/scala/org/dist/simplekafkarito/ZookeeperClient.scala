@@ -2,12 +2,12 @@ package org.dist.simplekafkarito
 
 import com.fasterxml.jackson.core.`type`.TypeReference
 import com.google.common.annotations.VisibleForTesting
-import org.I0Itec.zkclient.exception.ZkNoNodeException
-import org.I0Itec.zkclient.{IZkChildListener, ZkClient}
+import org.I0Itec.zkclient.exception.{ZkNoNodeException, ZkNodeExistsException}
+import org.I0Itec.zkclient.{IZkChildListener, IZkDataListener, ZkClient}
 import org.dist.kvstore.JsonSerDes
 import org.dist.queue.server.Config
-import org.dist.queue.utils.ZKStringSerializer
 import org.dist.queue.utils.ZkUtils.Broker
+import org.dist.queue.utils.{ZKStringSerializer, ZkUtils}
 
 import scala.jdk.CollectionConverters._
 
@@ -16,7 +16,11 @@ trait ZookeeperClient {
 
   def getAllBrokerIds(): Set[Int]
 
+  def getAllBrokers(): Set[Broker]
+
   def subscribeBrokerChangeListener(listener: IZkChildListener): Option[List[String]]
+
+  def subscribeControllerChangeListner(controller: Controller): Unit
 
   def getPartitionAssignmentsFor(topicName: String): List[PartitionReplicas]
 
@@ -24,7 +28,11 @@ trait ZookeeperClient {
 
   def setPartitionReplicasForTopic(topicName: String, partitionReplicas: Set[PartitionReplicas])
 
+  def setPartitionLeaderForTopic(topicName: String, leaderAndReplicas: List[LeaderAndReplicas])
+
   def subscribeTopicChangeListener(listener: IZkChildListener): Option[List[String]]
+
+  def tryCreatingControllerPath(data: String)
 }
 
 case class ControllerExistsException(controllerId: String) extends RuntimeException
@@ -34,6 +42,9 @@ private[simplekafkarito] class ZookeeperClientRitoImpl(config: Config) extends Z
 
   val BrokerTopicsPath = "/brokers/topics"
   val BrokerIdsPath = "/brokers/ids"
+  val ReplicaLeaderElectionPath = "/topics/replica/leader"
+  val ControllerPath = "/controller"
+
 
   override def registerSelf(): Unit = {
     val broker = Broker(config.brokerId, config.hostName, config.port)
@@ -99,6 +110,49 @@ private[simplekafkarito] class ZookeeperClientRitoImpl(config: Config) extends Z
     }
   }
 
+  def getReplicaLeaderElectionPath(topicName: String) = {
+    ReplicaLeaderElectionPath + "/" + topicName
+  }
+
+  override def setPartitionLeaderForTopic(topicName: String, leaderAndReplicas: List[LeaderAndReplicas]): Unit = {
+
+    val leaderReplicaSerializer = JsonSerDes.serialize(leaderAndReplicas)
+    val path = getReplicaLeaderElectionPath(topicName);
+
+    try {
+      ZkUtils.updatePersistentPath(zkClient, path, leaderReplicaSerializer)
+    } catch {
+      case e: Throwable => {
+        println("Exception while writing data to partition leader data" + e)
+      }
+    }
+  }
+
+  def getAllBrokers(): Set[Broker] = {
+    zkClient.getChildren(BrokerIdsPath).asScala.map(brokerId => {
+      val data: String = zkClient.readData(getBrokerPath(brokerId.toInt))
+      JsonSerDes.deserialize(data.getBytes, classOf[Broker])
+    }).toSet
+  }
+
+  override def subscribeControllerChangeListner(controller: Controller): Unit = {
+    zkClient.subscribeDataChanges(ControllerPath, new ControllerChangeListener(controller))
+  }
+
+  class ControllerChangeListener(controller: Controller) extends IZkDataListener {
+    override def handleDataChange(dataPath: String, data: Any): Unit = {
+      val existingControllerId: String = zkClient.readData(dataPath)
+      controller.setCurrent(existingControllerId.toInt)
+    }
+
+    override def handleDataDeleted(dataPath: String): Unit = {
+      controller.elect()
+      if (controller.currentLeader.equals(controller.brokerId)) {
+//        controller.electNewLeaderForPartition();
+      }
+    }
+  }
+
   def subscribeBrokerChangeListener(listener: IZkChildListener): Option[List[String]] = {
     val result = zkClient.subscribeChildChanges(BrokerIdsPath, listener)
     Option(result).map(_.asScala.toList)
@@ -112,5 +166,16 @@ private[simplekafkarito] class ZookeeperClientRitoImpl(config: Config) extends Z
   override def getPartitionAssignmentsFor(topicName: String): List[PartitionReplicas] = {
     val partitionAssignments: String = zkClient.readData(getTopicPath(topicName))
     JsonSerDes.deserialize[List[PartitionReplicas]](partitionAssignments.getBytes, new TypeReference[List[PartitionReplicas]]() {})
+  }
+
+  override def tryCreatingControllerPath(controllerId: String): Unit = {
+    try {
+      createEphemeralPath(zkClient, ControllerPath, controllerId)
+    } catch {
+      case e: ZkNodeExistsException => {
+        val existingControllerId: String = zkClient.readData(ControllerPath)
+        throw new ControllerExistsException(existingControllerId)
+      }
+    }
   }
 }
