@@ -18,6 +18,8 @@ trait ZookeeperClient {
   def subscribeBrokerChangeListener(listener: IZkChildListener): Option[List[String]]
 
   def getBrokerInfo(brokerId: Int): Broker
+
+  def setPartitionReplicasForTopic(topicName: String, partitionReplicas: Set[PartitionReplicas])
 }
 
 case class ControllerExistsException(controllerId: String) extends RuntimeException
@@ -25,6 +27,7 @@ case class ControllerExistsException(controllerId: String) extends RuntimeExcept
 private[simplekafkarito] class ZookeeperClientRitoImpl(config: Config) extends ZookeeperClient {
   private val zkClient = new ZkClient(config.zkConnect, config.zkSessionTimeoutMs, config.zkConnectionTimeoutMs, ZKStringSerializer)
 
+  val BrokerTopicsPath = "/brokers/topics"
   val BrokerIdsPath = "/brokers/ids"
 
   override def registerSelf(): Unit = {
@@ -48,6 +51,10 @@ private[simplekafkarito] class ZookeeperClientRitoImpl(config: Config) extends Z
     BrokerIdsPath + "/" + id
   }
 
+  private def getTopicPath(topicName: String) = {
+    BrokerTopicsPath + "/" + topicName
+  }
+
   def createEphemeralPath(client: ZkClient, path: String, data: String): Unit = {
     try {
       client.createEphemeral(path, data)
@@ -59,6 +66,12 @@ private[simplekafkarito] class ZookeeperClientRitoImpl(config: Config) extends Z
     }
   }
 
+  override def setPartitionReplicasForTopic(topicName: String, partitionReplicas: Set[PartitionReplicas]) = {
+    val topicsPath = getTopicPath(topicName)
+    val topicsData = JsonSerDes.serialize(partitionReplicas)
+    createPersistentPath(zkClient, topicsPath, topicsData)
+  }
+
   def getBrokerInfo(brokerId: Int): Broker = {
     val data: String = zkClient.readData(getBrokerPath(brokerId))
     JsonSerDes.deserialize(data.getBytes, classOf[Broker])
@@ -68,6 +81,17 @@ private[simplekafkarito] class ZookeeperClientRitoImpl(config: Config) extends Z
     val parentDir = path.substring(0, path.lastIndexOf('/'))
     if (parentDir.length != 0)
       client.createPersistent(parentDir, true)
+  }
+
+  def createPersistentPath(client: ZkClient, path: String, data: String = ""): Unit = {
+    try {
+      client.createPersistent(path, data)
+    } catch {
+      case e: ZkNoNodeException => {
+        createParentPath(client, path)
+        client.createPersistent(path, data)
+      }
+    }
   }
 
   def subscribeBrokerChangeListener(listener: IZkChildListener): Option[List[String]] = {

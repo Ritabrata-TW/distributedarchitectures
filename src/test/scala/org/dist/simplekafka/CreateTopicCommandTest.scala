@@ -1,6 +1,6 @@
 package org.dist.simplekafka
 
-import org.I0Itec.zkclient.{IZkChildListener, IZkDataListener, ZkClient}
+import org.I0Itec.zkclient.IZkChildListener
 import org.dist.queue.utils.ZkUtils.Broker
 import org.scalatest.FunSuite
 
