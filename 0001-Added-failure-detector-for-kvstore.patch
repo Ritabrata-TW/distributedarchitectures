@@ -1,0 +1,739 @@
+From 7fff728b0d43a30a08030df67cc5181569cf2399 Mon Sep 17 00:00:00 2001
+From: unmesh <unmeshjoshi@gmail.com>
+Date: Sat, 8 Feb 2020 07:35:10 +0530
+Subject: [PATCH] Added failure detector for kvstore
+
+---
+ .../org/dist/kvstore/ArrivalWindow.scala      |  62 ++++++++
+ .../org/dist/kvstore/EndPointState.scala      |  11 +-
+ .../org/dist/kvstore/FailureDetector.java     |   7 -
+ .../org/dist/kvstore/FailureDetector.scala    |  42 ++++++
+ .../scala/org/dist/kvstore/Gossiper.scala     | 140 +++++++++++++++---
+ .../org/dist/kvstore/IFailureDetector.java    |  59 ++++++++
+ .../org/dist/kvstore/MessagingService.scala   |  12 +-
+ .../scala/org/dist/kvstore/StorageProxy.scala |  10 +-
+ .../org/dist/kvstore/StorageService.scala     |   4 +-
+ .../scala/org/dist/patterns/wal/Wal.scala     |   5 +-
+ .../org/dist/simplegossip/Gossiper.scala      |   2 +-
+ .../org/dist/versionedkvstore/Client.scala    |  17 ++-
+ .../StorageServiceGossipTest.scala            |   2 +
+ .../versionedkvstore/VersionedMapTest.scala   |  16 +-
+ 14 files changed, 332 insertions(+), 57 deletions(-)
+ create mode 100644 src/main/scala/org/dist/kvstore/ArrivalWindow.scala
+ delete mode 100644 src/main/scala/org/dist/kvstore/FailureDetector.java
+ create mode 100644 src/main/scala/org/dist/kvstore/FailureDetector.scala
+ create mode 100644 src/main/scala/org/dist/kvstore/IFailureDetector.java
+
+diff --git a/src/main/scala/org/dist/kvstore/ArrivalWindow.scala b/src/main/scala/org/dist/kvstore/ArrivalWindow.scala
+new file mode 100644
+index 0000000..f930b73
+--- /dev/null
++++ b/src/main/scala/org/dist/kvstore/ArrivalWindow.scala
+@@ -0,0 +1,62 @@
++package org.dist.kvstore
++
++import java.util
++
++class ArrivalWindow(size:Int) {
++  private var tLast_ = 0d
++  private var arrivalIntervals_ = new util.ArrayList[Double](size)
++
++  private[kvstore] def add(value: Double): Unit = {
++    if (arrivalIntervals_.size == size) arrivalIntervals_.remove(0)
++    var interArrivalTime = 0d
++    if (tLast_ > 0d) interArrivalTime = value - tLast_
++    tLast_ = value
++    arrivalIntervals_.add(interArrivalTime)
++  }
++
++  private[kvstore] def sum = {
++    var sum = 0d
++    val size = arrivalIntervals_.size
++    for (i <- 0 until size) {
++      sum += arrivalIntervals_.get(i)
++    }
++    sum
++  }
++
++  private[kvstore] def sumOfDeviations = {
++    var sumOfDeviations = 0d
++    val size = arrivalIntervals_.size
++    for (i <- 0 until size) {
++      sumOfDeviations += (arrivalIntervals_.get(i) - mean) * (arrivalIntervals_.get(i) - mean)
++    }
++    sumOfDeviations
++  }
++
++  private[kvstore] def mean = sum / arrivalIntervals_.size
++
++  private[kvstore] def variance = sumOfDeviations / arrivalIntervals_.size
++
++  private[kvstore] def deviation = Math.sqrt(variance)
++
++  private[kvstore] def clear(): Unit = {
++    arrivalIntervals_.clear()
++  }
++
++  private[kvstore] def p(t: Double) = { // Stat stat = new Stat();
++    /* Exponential CDF = 1 -e^-lambda*x */
++    val exponent = (-1) * t / mean
++    1 - (1 - Math.pow(Math.E, exponent))
++    // return stat.gaussianCDF(mean, deviation, t, Double.POSITIVE_INFINITY);
++  }
++
++  private[kvstore] def phi(tnow: Long) = {
++    val size = arrivalIntervals_.size
++    var log = 0d
++    if (size > 0) {
++      val t = tnow - tLast_
++      val probability = p(t)
++      log = (-1) * Math.log10(probability)
++    }
++    log
++  }
++}
+\ No newline at end of file
+diff --git a/src/main/scala/org/dist/kvstore/EndPointState.scala b/src/main/scala/org/dist/kvstore/EndPointState.scala
+index d3777c5..7530c31 100644
+--- a/src/main/scala/org/dist/kvstore/EndPointState.scala
++++ b/src/main/scala/org/dist/kvstore/EndPointState.scala
+@@ -5,9 +5,12 @@ import java.util.{Collections, Map}
+ 
+ import scala.jdk.CollectionConverters._
+ 
+-case class EndPointState(heartBeatState: HeartBeatState,
++case class EndPointState(var heartBeatState: HeartBeatState,
+                          applicationStates:Map[ApplicationState, VersionedValue] = new util.EnumMap[ApplicationState, VersionedValue](classOf[ApplicationState]),
+-                         updateTimestamp:Long = System.nanoTime()) {
++                         updateTimestamp:Long = System.nanoTime(),
++                         isAlive:Boolean = true,
++                         updateTimeStamp:Long = System.currentTimeMillis()) {
++
+   def addApplicationState(key: ApplicationState, value: VersionedValue): EndPointState = {
+     addApplicationStates(Collections.singletonMap(key, value))
+   }
+@@ -35,4 +38,8 @@ case class EndPointState(heartBeatState: HeartBeatState,
+     versions.clear()
+     maxVersion
+   }
++
++  def markSuspected(): EndPointState = {
++    this.copy(isAlive = false)
++  }
+ }
+diff --git a/src/main/scala/org/dist/kvstore/FailureDetector.java b/src/main/scala/org/dist/kvstore/FailureDetector.java
+deleted file mode 100644
+index e694770..0000000
+--- a/src/main/scala/org/dist/kvstore/FailureDetector.java
++++ /dev/null
+@@ -1,7 +0,0 @@
+-package org.dist.kvstore;
+-
+-public class FailureDetector {
+-    public static boolean isAlive(InetAddressAndPort tmpInetAddressAndPort) {
+-        return true;
+-    }
+-}
+diff --git a/src/main/scala/org/dist/kvstore/FailureDetector.scala b/src/main/scala/org/dist/kvstore/FailureDetector.scala
+new file mode 100644
+index 0000000..cf408d2
+--- /dev/null
++++ b/src/main/scala/org/dist/kvstore/FailureDetector.scala
+@@ -0,0 +1,42 @@
++package org.dist.kvstore
++
++import java.util
++
++import org.dist.queue.common.Logging
++
++object FailureDetector {
++  def isAlive(sp:InetAddressAndPort) = true
++}
++
++class FailureDetector(gossiper: Gossiper) extends Logging {
++  private val arrivalSamples_ = new util.Hashtable[InetAddressAndPort, ArrivalWindow]
++  private val sampleSize_ = 1000
++  private val phiSuspectThreshold_ = 5
++  private val phiConvictThreshold_ = 8
++  /* The Failure Detector has to have been up for atleast 1 min. */
++  private val uptimeThreshold_ = 60000
++
++  def report(ep: InetAddressAndPort): Unit = {
++    val now = System.currentTimeMillis
++    var hbWnd = arrivalSamples_.get(ep)
++    if (hbWnd == null) {
++      hbWnd = new ArrivalWindow(sampleSize_)
++      arrivalSamples_.put(ep, hbWnd)
++    }
++    hbWnd.add(now)
++  }
++
++  def intepret(ep: InetAddressAndPort): Unit = {
++    val hbWnd = arrivalSamples_.get(ep)
++    if (hbWnd == null) return
++    val now = System.currentTimeMillis
++    /* We need this so that we do not suspect a convict. */ val isConvicted = false
++    val phi = hbWnd.phi(now)
++    info("PHI for " + ep + " : " + phi)
++    if (!isConvicted && phi > phiSuspectThreshold_) {
++        gossiper.suspect(ep)
++    }
++  }
++}
++
++
+diff --git a/src/main/scala/org/dist/kvstore/Gossiper.scala b/src/main/scala/org/dist/kvstore/Gossiper.scala
+index d67e970..cd45316 100644
+--- a/src/main/scala/org/dist/kvstore/Gossiper.scala
++++ b/src/main/scala/org/dist/kvstore/Gossiper.scala
+@@ -3,8 +3,9 @@ package org.dist.kvstore
+ import java.util
+ import java.util.concurrent.locks.ReentrantLock
+ import java.util.concurrent.{ConcurrentHashMap, ScheduledThreadPoolExecutor, TimeUnit}
+-import java.util.{ArrayList, Collections, List, Random}
++import java.util.{ArrayList, Collections, List, Random, Set}
+ 
++import org.dist.queue.common.Logging
+ import org.slf4j.LoggerFactory
+ 
+ import scala.jdk.CollectionConverters._
+@@ -28,10 +29,20 @@ class Gossiper(private[kvstore] val generationNbr: Int,
+                private[kvstore] val executor: ScheduledThreadPoolExecutor = new ScheduledThreadPoolExecutor(1),
+                private[kvstore] val messagingService: MessagingService,
+                private[kvstore] val liveEndpoints: util.List[InetAddressAndPort] = new util.ArrayList[InetAddressAndPort],
+-               private[kvstore] val unreachableEndpoints: util.List[InetAddressAndPort] = new util.ArrayList[InetAddressAndPort]) {
++               private[kvstore] val unreachableEndpoints: util.List[InetAddressAndPort] = new util.ArrayList[InetAddressAndPort]) extends Logging {
++
++  val failureDetector = new FailureDetector(this)
++
++  def suspect(ep: InetAddressAndPort) = {
++    val state = endpointStatemap.get(ep)
++    info(s"Marking ${ep} as suspected. Adding to unreachable endpoints")
++    endpointStatemap.put(ep, state.markSuspected())
++    liveEndpoints.remove(ep)
++    unreachableEndpoints.add(ep)
++  }
++
+ 
+   private[kvstore] val versionGenerator = new VersionGenerator()
+-  private[kvstore] val logger = LoggerFactory.getLogger(classOf[Gossiper])
+   private[kvstore] val seeds = config.nonLocalSeeds(localEndPoint)
+   private[kvstore] val endpointStatemap = new ConcurrentHashMap[InetAddressAndPort, EndPointState]
+   private val subscribers = new util.ArrayList[IEndPointStateChangeSubscriber]
+@@ -48,10 +59,6 @@ class Gossiper(private[kvstore] val generationNbr: Int,
+     endpointStatemap.put(localEndPoint, newState)
+   }
+ 
+-  def notifyFailureDetector(epStateMap: util.Map[InetAddressAndPort, EndPointState]) = {
+-
+-  }
+-
+   def initializeLocalEndpointState() = {
+     var localState = endpointStatemap.get(localEndPoint)
+     if (localState == null) {
+@@ -94,10 +101,11 @@ class Gossiper(private[kvstore] val generationNbr: Int,
+             val remoteMaxVersion = remoteState.getMaxEndPointStateVersion()
+             if (remoteMaxVersion > localMaxVersion) {
+               resusitate(ep, localEpStatePtr)
+-              val newHeartbeatState = applyHeartBeatStateLocally(ep, localEpStatePtr, remoteState)
++              val newEndpointState = applyHeartBeatStateLocally(ep, localEpStatePtr, remoteState)
++              endpointStatemap.put(ep, newEndpointState)
+               //TODO This has to be implemented
+               /* apply ApplicationState */
+-              //              applyApplicationStateLocally(ep, localEpStatePtr, remoteState)
++//              applyApplicationStateLocally(ep, localEpStatePtr, remoteState)
+             }
+           }
+         } else {
+@@ -108,42 +116,42 @@ class Gossiper(private[kvstore] val generationNbr: Int,
+   }
+ 
+   def resusitate(addr: InetAddressAndPort, localState: EndPointState) = {
+-    logger.debug("Attempting to resusitate " + addr)
++    debug("Attempting to resusitate " + addr)
+     markLiveOrUnreachable(addr, localState, true)
+-    logger.debug("EndPoint " + addr + " is now UP")
++    debug("EndPoint " + addr + " is now UP")
+   }
+ 
+   def doNotifications(ep: InetAddressAndPort, epState: EndPointState): Unit = {
+-    logger.info(s"notifications for ${ep} ${epState}")
++    info(s"notifications for ${ep} ${epState}")
+     for(subscriber <- subscribers.asScala) {
+       subscriber.onChange(ep, epState)
+     }
+   }
+ 
+-  private[kvstore] def applyHeartBeatStateLocally(addr: InetAddressAndPort, localState: EndPointState, remoteState: EndPointState): Unit = {
++  private[kvstore] def applyHeartBeatStateLocally(addr: InetAddressAndPort, localState: EndPointState, remoteState: EndPointState): EndPointState = {
+     val localHbState = localState.heartBeatState
+     val remoteHbState = remoteState.heartBeatState
+     if (remoteHbState.generation > localHbState.generation) {
+       resusitate(addr, localState)
+-      return localState.copy(remoteHbState)
++      return localState.copy(remoteHbState, updateTimeStamp = System.currentTimeMillis())
+     }
+     if (localHbState.generation == remoteHbState.generation) {
+       if (remoteHbState.version > localHbState.version) {
+         val oldVersion = localHbState.version
+ 
+-        logger.debug("Updating heartbeat state version to " + localState.heartBeatState.version + " from " + oldVersion + " for " + addr + " ...")
+-        return localState.copy(remoteHbState)
++        debug("Updating heartbeat state version to " + localState.heartBeatState.version + " from " + oldVersion + " for " + addr + " ...")
++        return localState.copy(remoteHbState, updateTimeStamp = System.currentTimeMillis())
+       }
+     }
+     localState
+   }
+ 
+   private def handleNewJoin(ep: InetAddressAndPort, epState: EndPointState): Unit = {
+-    logger.info("Node " + ep + " has now joined.")
++    info("Node " + ep + " has now joined.")
+     /* Mark this endpoint as "live" */
+     endpointStatemap.put(ep, epState)
+     markLiveOrUnreachable(ep, epState, true)
+-    logger.info(s"Enpoint State Map for ${localEndPoint} is ${endpointStatemap}")
++    info(s"Enpoint State Map for ${localEndPoint} is ${endpointStatemap}")
+     /* Notify interested parties about endpoint state change */
+     doNotifications(ep, epState)
+   }
+@@ -165,7 +173,7 @@ class Gossiper(private[kvstore] val generationNbr: Int,
+       sb.append(gDigest)
+       sb.append(" ")
+     }
+-    logger.trace("Gossip Digests are : " + sb.toString)
++    trace("Gossip Digests are : " + sb.toString)
+   }
+ 
+   /*
+@@ -204,6 +212,7 @@ class Gossiper(private[kvstore] val generationNbr: Int,
+                                  with version greater than the max remote version.
+           */
+             if (maxRemoteVersion > maxLocalVersion)
++              info(s"MaxVersion ${maxRemoteVersion} is greater than ${maxLocalVersion} for ${gDigest.endPoint}. Asking for it")
+               deltaGossipDigestList.add(new GossipDigest(gDigest.endPoint, remoteGeneration, maxLocalVersion))
+             if (maxRemoteVersion < maxLocalVersion)
+             /* send all data with generation = localgeneration and version > maxRemoteVersion */
+@@ -218,6 +227,67 @@ class Gossiper(private[kvstore] val generationNbr: Int,
+     }
+   }
+ 
++  def notifyFailureDetector(gDigests: util.List[GossipDigest]): Unit = {
++    val fd = failureDetector
++    import scala.jdk.CollectionConverters._
++    for (gDigest <- gDigests.asScala) {
++      val localEndPointState = endpointStatemap.get(gDigest.endPoint)
++      /*
++                   * If the local endpoint state exists then report to the FD only
++                   * if the versions workout.
++                  */ if (localEndPointState != null) {
++        val localGeneration = endpointStatemap.get(gDigest.endPoint).heartBeatState.generation
++        val remoteGeneration = gDigest.generation
++        if (remoteGeneration > localGeneration) {
++          info("Reporting " + gDigest.endPoint + " to the FD.")
++          fd.report(gDigest.endPoint)
++//          continue //todo: continue is not supported
++        }
++        if (remoteGeneration == localGeneration) {
++          val localVersion = localEndPointState.getMaxEndPointStateVersion()
++          //int localVersion = endPointStateMap_.get(gDigest.endPoint_).getHeartBeatState().getHeartBeatVersion();
++          val remoteVersion = gDigest.maxVersion
++          if (remoteVersion > localVersion) {
++            info("Reporting " + gDigest.endPoint + " to the FD.")
++            fd.report(gDigest.endPoint)
++          }
++        }
++      }
++    }
++  }
++
++  def notifyFailureDetector(remoteEpStateMap: util.Map[InetAddressAndPort, EndPointState]): Unit = {
++    val fd = failureDetector
++    val endpoints = remoteEpStateMap.keySet
++    for (endpoint <- endpoints.asScala) {
++      val remoteEndPointState = remoteEpStateMap.get(endpoint)
++      val localEndPointState = endpointStatemap.get(endpoint)
++      /*
++                   * If the local endpoint state exists then report to the FD only
++                   * if the versions workout.
++                  */ if (localEndPointState != null) {
++        val localGeneration = localEndPointState.heartBeatState.generation
++        val remoteGeneration = remoteEndPointState.heartBeatState.generation
++        if (remoteGeneration > localGeneration) {
++          info("Reporting " + endpoint + " to the FD.")
++          fd.report(endpoint)
++//          continue //todo: continue is not supported
++
++        }
++        if (remoteGeneration == localGeneration) {
++          val localVersion = localEndPointState.getMaxEndPointStateVersion()
++          //int localVersion = localEndPointState.getHeartBeatState().getHeartBeatVersion();
++          val remoteVersion = remoteEndPointState.heartBeatState.version
++          if (remoteVersion > localVersion) {
++            info("Reporting " + endpoint + " to the FD.")
++            fd.report(endpoint)
++          }
++        }
++      }
++    }
++  }
++
++
+   /**
+    * initial gossipdigest empty endpoint state
+    * endpoint state having same generation same version
+@@ -227,7 +297,6 @@ class Gossiper(private[kvstore] val generationNbr: Int,
+    * send only endpoint state higher than the remote version
+    */
+ 
+-
+   /* Request all the state for the endpoint in the gDigest */
+   private[kvstore] def requestAll(gDigest: GossipDigest, deltaGossipDigestList: util.List[GossipDigest], remoteGeneration: Int): Unit = {
+     /* We are here since we have no data for this endpoint locally so request everthing. */
+@@ -289,6 +358,9 @@ class Gossiper(private[kvstore] val generationNbr: Int,
+         if (!sentToSeedNode) { //If live members chosen to send gossip already had seed node, dont send message to seed
+           doGossipToSeed(gossipDigestSynMessage)
+         }
++
++        doStatusCheck()
++
+       } catch {
+         case ex:Exception => ex.printStackTrace()
+       } finally {
+@@ -296,6 +368,30 @@ class Gossiper(private[kvstore] val generationNbr: Int,
+       }
+     }
+ 
++    val aVeryLongTime_ = 259200 * 1000
++
++   def evictFromMembership(endpoint: InetAddressAndPort): Unit = {
++      unreachableEndpoints.remove(endpoint)
++    }
++
++    private def doStatusCheck(): Unit = {
++      val now = System.currentTimeMillis
++      val eps = endpointStatemap.keySet.asScala
++      import scala.jdk.CollectionConverters._
++      for (endpoint <- eps) {
++        if (endpoint != localEndPoint) { //continue //todo: continue is not supported
++        failureDetector.intepret(endpoint)
++        val epState = endpointStatemap.get(endpoint)
++        if (epState != null) {
++          val l = now - epState.updateTimeStamp
++          val duration = now - l
++          if (!epState.isAlive && (duration > aVeryLongTime_)) evictFromMembership(endpoint)
++        }
++        }
++      }
++    }
++
++
+     private def doGossipToSeed(message: Message): Unit = {
+       val size = seeds.size
+       if (size > 0) {
+@@ -328,7 +424,7 @@ class Gossiper(private[kvstore] val generationNbr: Int,
+       val index = if (size == 1) 0
+       else random.nextInt(size)
+       val to = liveEndPoints.get(index)
+-      logger.trace("Sending a GossipDigestSynMessage to " + to + " ..." + "from " + message.header.from)
++      trace("Sending a GossipDigestSynMessage to " + to + " ..." + "from " + message.header.from)
+       messagingService.sendTcpOneWay(message, to)
+       seeds.contains(to)
+     }
+@@ -343,7 +439,7 @@ class Gossiper(private[kvstore] val generationNbr: Int,
+     private def updateLocalHeartbeatCounter = {
+       /* Update the local heartbeat counter. */
+       val state = endpointStatemap.get(localEndPoint)
+-      val newState = state.copy(state.heartBeatState.updateVersion(versionGenerator.incrementAndGetVersion))
++      val newState = state.copy(state.heartBeatState.updateVersion(versionGenerator.incrementAndGetVersion), updateTimeStamp = System.currentTimeMillis())
+       endpointStatemap.put(localEndPoint, newState)
+     }
+   }
+diff --git a/src/main/scala/org/dist/kvstore/IFailureDetector.java b/src/main/scala/org/dist/kvstore/IFailureDetector.java
+new file mode 100644
+index 0000000..191f7ea
+--- /dev/null
++++ b/src/main/scala/org/dist/kvstore/IFailureDetector.java
+@@ -0,0 +1,59 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.dist.kvstore;
++
++/**
++ * An interface that provides an application with the ability
++ * to query liveness information of a node in the cluster. It 
++ * also exposes methods which help an application register callbacks
++ * for notifications of liveness information of nodes.
++ * 
++ * Author : Avinash Lakshman ( alakshman@facebook.com) & Prashant Malik ( pmalik@facebook.com )
++ */
++
++public interface IFailureDetector
++{
++    /**
++     * Failure Detector's knowledge of whether a node is up or
++     * down.
++     * 
++     * @param ep InetAddressAndPort in question.
++     * @return true if UP and false if DOWN.
++     */
++    public boolean isAlive(InetAddressAndPort ep);
++    
++    /**
++     * This method is invoked by any entity wanting to interrogate the status of an InetAddressAndPort. 
++     * In our case it would be the Gossiper. The Failure Detector will then calculate Phi and
++     * deem an InetAddressAndPort as suspicious or alive as explained in the Hayashibara paper. 
++     * 
++     * param ep InetAddressAndPort for which we interpret the inter arrival times.
++    */
++    public void intepret(InetAddressAndPort ep);
++    
++    /**
++     * This method is invoked by the receiver of the heartbeat. In our case it would be
++     * the Gossiper. Gossiper inform the Failure Detector on receipt of a heartbeat. The
++     * FailureDetector will then sample the arrival time as explained in the paper.
++     * 
++     * param ep InetAddressAndPort being reported.
++    */
++    public void report(InetAddressAndPort ep);
++    
++}
+diff --git a/src/main/scala/org/dist/kvstore/MessagingService.scala b/src/main/scala/org/dist/kvstore/MessagingService.scala
+index bc3bafb..df77792 100644
+--- a/src/main/scala/org/dist/kvstore/MessagingService.scala
++++ b/src/main/scala/org/dist/kvstore/MessagingService.scala
+@@ -3,6 +3,7 @@ package org.dist.kvstore
+ import java.net.{InetSocketAddress, ServerSocket, Socket}
+ import java.util
+ 
++import org.dist.queue.common.Logging
+ import org.dist.util.SocketIO
+ import org.slf4j.LoggerFactory
+ 
+@@ -60,6 +61,7 @@ class TcpListener(localEp: InetAddressAndPort, storageService: StorageService, g
+       val deltaGossipDigest = new util.ArrayList[GossipDigest]()
+       val deltaEndPointStates = new util.HashMap[InetAddressAndPort, EndPointState]()
+       gossiper.examineGossiper(gossipDigestSyn.gDigests, deltaGossipDigest, deltaEndPointStates)
++      gossiper.notifyFailureDetector(gossipDigestSyn.gDigests)
+ 
+       val synAckMessage = new gossiper.GossipSynAckMessageBuilder().makeGossipDigestAckMessage(deltaGossipDigest, deltaEndPointStates)
+       messagingService.sendTcpOneWay(synAckMessage, synMessage.header.from)
+@@ -107,7 +109,7 @@ trait MessageResponseHandler {
+ }
+ 
+ 
+-class MessagingService(storageService: StorageService) {
++class MessagingService(storageService: StorageService) extends Logging {
+   val callbackMap = new util.HashMap[String, MessageResponseHandler]()
+   var gossiper: Gossiper = _
+ 
+@@ -126,8 +128,12 @@ class MessagingService(storageService: StorageService) {
+   }
+ 
+   def sendTcpOneWay(message: Message, to: InetAddressAndPort) = {
+-    val clientSocket = new Socket(to.address, to.port)
+-    new SocketIO[Message](clientSocket, classOf[Message]).write(message)
++    try {
++      val clientSocket = new Socket(to.address, to.port)
++      new SocketIO[Message](clientSocket, classOf[Message]).write(message)
++    } catch {
++      case e:Exception ⇒ error(s"Error connecting to ${to}. It might be down")
++    }
+   }
+ 
+   def sendUdpOneWay(message: Message, to: InetAddressAndPort) = {
+diff --git a/src/main/scala/org/dist/kvstore/StorageProxy.scala b/src/main/scala/org/dist/kvstore/StorageProxy.scala
+index 60964e8..e0e4347 100644
+--- a/src/main/scala/org/dist/kvstore/StorageProxy.scala
++++ b/src/main/scala/org/dist/kvstore/StorageProxy.scala
+@@ -1,12 +1,15 @@
+ package org.dist.kvstore
+ 
+ import java.net.{InetSocketAddress, ServerSocket, Socket}
++import java.util
++import java.util.Map
+ import java.util.concurrent.TimeUnit
+ import java.util.concurrent.atomic.AtomicBoolean
+ import java.util.concurrent.locks.{Condition, Lock, ReentrantLock}
+ 
+ import org.dist.util.SocketIO
+ import org.slf4j.LoggerFactory
++
+ import scala.jdk.CollectionConverters._
+ 
+ 
+@@ -50,9 +53,10 @@ class TcpClientRequestListner(localEp: InetAddressAndPort, storageService:Storag
+   class RowMutationHandler(storageService: StorageService) {
+     def handleMessage(rowMutationMessage: Message) = {
+       val rowMutation = JsonSerDes.deserialize(rowMutationMessage.payloadJson.getBytes, classOf[RowMutation])
+-      val serversHostingKey = storageService.getNStorageEndPointMap(rowMutation.key)
+-      val quorumResponseHandler = new QuorumResponseHandler(serversHostingKey.size, new WriteResponseResolver())
+-      messagingService.sendRR(rowMutationMessage, serversHostingKey.toList, quorumResponseHandler)
++      val endpointMap = storageService.getNStorageEndPointMap(rowMutation.key)
++
++      val quorumResponseHandler = new QuorumResponseHandler(endpointMap.values().size(), new WriteResponseResolver())
++           messagingService.sendRR(rowMutationMessage, endpointMap.values().asScala.toList, quorumResponseHandler)
+       quorumResponseHandler.get()
+     }
+   }
+diff --git a/src/main/scala/org/dist/kvstore/StorageService.scala b/src/main/scala/org/dist/kvstore/StorageService.scala
+index 8c14aca..3185a87 100644
+--- a/src/main/scala/org/dist/kvstore/StorageService.scala
++++ b/src/main/scala/org/dist/kvstore/StorageService.scala
+@@ -41,9 +41,9 @@ class StorageService(clientListenAddress:InetAddressAndPort, controlListenAddres
+    * param @ key - key for which we need to find the endpoint return value -
+    * the endpoint responsible for this key
+    */
+-  def getNStorageEndPointMap(key: String): Array[InetAddressAndPort] = {
++  def getNStorageEndPointMap(key: String): util.Map[InetAddressAndPort, InetAddressAndPort]= {
+     val token: BigInteger = hash(key)
+-    nodePicker.getStorageEndPoints(token)
++    nodePicker.getHintedStorageEndPoints(token)
+   }
+ 
+   /**
+diff --git a/src/main/scala/org/dist/patterns/wal/Wal.scala b/src/main/scala/org/dist/patterns/wal/Wal.scala
+index f91d90c..17b6fe3 100644
+--- a/src/main/scala/org/dist/patterns/wal/Wal.scala
++++ b/src/main/scala/org/dist/patterns/wal/Wal.scala
+@@ -23,9 +23,8 @@ object Wal {
+   def logFileName() = s"${logPrefix}-${firstLogId}${logSuffix}"
+ 
+ 
+-  import java.nio.ByteBuffer
+-  def newBuffer(size:Int) = {
+-    val buf = ByteBuffer.allocate(size)
++  def newBuffer(size:Int):ByteBuffer = {
++    val buf: ByteBuffer = ByteBuffer.allocate(size)
+     buf.clear
+   }
+ }
+diff --git a/src/main/scala/org/dist/simplegossip/Gossiper.scala b/src/main/scala/org/dist/simplegossip/Gossiper.scala
+index c90111b..82d990e 100644
+--- a/src/main/scala/org/dist/simplegossip/Gossiper.scala
++++ b/src/main/scala/org/dist/simplegossip/Gossiper.scala
+@@ -5,7 +5,7 @@ import java.util
+ import java.util.concurrent.{ConcurrentHashMap, ScheduledThreadPoolExecutor, TimeUnit}
+ import java.util.{Collections, Random}
+ 
+-import org.dist.kvstore.{GossipDigest, GossipDigestSyn, Header, InetAddressAndPort, JsonSerDes, Message, Stage, TokenMetadata, Verb}
++import org.dist.kvstore.{EndPointState, GossipDigest, GossipDigestSyn, Header, InetAddressAndPort, JsonSerDes, Message, Stage, TokenMetadata, Verb}
+ import org.dist.queue.common.Logging
+ 
+ import scala.jdk.CollectionConverters._
+diff --git a/src/main/scala/org/dist/versionedkvstore/Client.scala b/src/main/scala/org/dist/versionedkvstore/Client.scala
+index a9ceba3..cd146dd 100644
+--- a/src/main/scala/org/dist/versionedkvstore/Client.scala
++++ b/src/main/scala/org/dist/versionedkvstore/Client.scala
+@@ -5,15 +5,17 @@ import java.util
+ import org.dist.queue.common.Logging
+ import scala.jdk.CollectionConverters._
+ 
+-class Client[K, V] extends Logging {
+-  val metadataRefreshAttempts: Int = 2
++class FailureDetector[K, V] {
++  def isAvailable(node:Node[K, V]): Unit = {
++    return true
++  }
++}
+ 
+-  val node1 = new Node[K, V](1, List(1, 2, 3).asJava)
+-  val node2 = new Node[K, V](2, List(4, 5, 6).asJava)
+-  val node3 = new Node[K, V](3, List(7, 8, 9).asJava)
++class Client[K, V](nodes:List[Node[K, V]], failureDetector:FailureDetector[K, V]) extends Logging {
++  val metadataRefreshAttempts: Int = 2
+ 
+   def put(key: K, value: V): Version = {
+-    val master = node1 //assume node1 is always the master and node2 is replica
++    val master = nodes(0) //assume node1 is always the master and node2 is replica
+     val version = getVersionForPut(key)
+     val versioned = Versioned.value(value, version)
+     val versionedClock = versioned.getVersion.asInstanceOf[VectorClock]
+@@ -36,7 +38,7 @@ class Client[K, V] extends Logging {
+   def get(key: K): Versioned[V] = {
+     for (attempts <- 0 until this.metadataRefreshAttempts) {
+       try {
+-        val items: util.List[Versioned[V]] = node1.get(key)
++        val items: util.List[Versioned[V]] = nodes(0).get(key)
+         val resolvedItems = new VectorClockInconsistencyResolver[V]().resolveConflicts(items)
+         return getItemOrThrow(key,resolvedItems)
+       } catch {
+@@ -53,7 +55,6 @@ class Client[K, V] extends Logging {
+   }
+ 
+   def getVersionWithResolution(key: K) = {
+-    val nodes = List[Node[K, V]](node1, node2)
+     val versions = nodes.flatMap(n ⇒ n.getVersions(key).asScala)
+     if (versions.isEmpty) null
+     else if (versions.size == 1) versions(0)
+diff --git a/src/test/scala/org/dist/simplegossip/StorageServiceGossipTest.scala b/src/test/scala/org/dist/simplegossip/StorageServiceGossipTest.scala
+index f22bdc1..4437fb0 100644
+--- a/src/test/scala/org/dist/simplegossip/StorageServiceGossipTest.scala
++++ b/src/test/scala/org/dist/simplegossip/StorageServiceGossipTest.scala
+@@ -35,6 +35,8 @@ class StorageServiceGossipTest extends FunSuite {
+       assert(s1.gossiper.endpointStatemap.values().contains(s.gossiper.token))
+     })
+ 
++    Thread.sleep(10000)
++
+     val client = new Client(clientListenAddress)
+     val mutationResponses: Seq[RowMutationResponse] = client.put("table1", "key1", "value1")
+     assert(mutationResponses.size == 2)
+diff --git a/src/test/scala/org/dist/versionedkvstore/VersionedMapTest.scala b/src/test/scala/org/dist/versionedkvstore/VersionedMapTest.scala
+index ea62e02..41dc35c 100644
+--- a/src/test/scala/org/dist/versionedkvstore/VersionedMapTest.scala
++++ b/src/test/scala/org/dist/versionedkvstore/VersionedMapTest.scala
+@@ -1,8 +1,7 @@
+ package org.dist.versionedkvstore
+ 
+-import java.util
+-
+ import org.scalatest.FunSuite
++import scala.jdk.CollectionConverters._
+ 
+ class VersionedMapTest extends FunSuite {
+ 
+@@ -14,15 +13,20 @@ class VersionedMapTest extends FunSuite {
+   test("should put versioned entry for new key") {
+     val currentTime = System.currentTimeMillis()
+ 
+-    val client = new Client[String, String]()
++    val node1 = new Node[String, String](1, List(1, 2, 3).asJava)
++    val node2 = new Node[String, String](2, List(4, 5, 6).asJava)
++    val node3 = new Node[String, String](3, List(7, 8, 9).asJava)
++
++    val client = new Client[String, String](List(node1, node2, node3),new FailureDetector[String, String]())
+     val version: Version = client.put("newKey", "newValue")
+ 
+     assert("newValue" == client.get("newKey").value)
+ 
+-    val clock = new VectorClock()
+-    assert(clock.incremented(1, currentTime) == client.get("newKey").version)
++    val newClock = new VectorClock()
++    val clock1 = newClock.incremented(1, currentTime)
++    assert(clock1 == client.get("newKey").version)
+ 
+     client.put("newKey", "anotherValue") //
+-    assert(clock.incremented(1, currentTime).incremented(1, currentTime) == client.get("newKey").version)
++    assert(clock1.incremented(1, currentTime) == client.get("newKey").version)
+   }
+ }
+-- 
+2.23.0
+
