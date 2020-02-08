@@ -18,7 +18,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
  * on the ring.
  */
 public class RackUnawareStrategy extends AbstractStrategy
-{   
+{
     /* Use this flag to check if initialization is in order. */
     private AtomicBoolean initialized_ = new AtomicBoolean(false);
     private int replicationFactor = 2;
@@ -30,9 +30,9 @@ public class RackUnawareStrategy extends AbstractStrategy
 
     public InetAddressAndPort[] getStorageEndPoints(BigInteger token)
     {
-        return getStorageEndPoints(token, tokenMetadata_.cloneTokenEndPointMap());            
+        return getStorageEndPoints(token, tokenMetadata_.cloneTokenEndPointMap());
     }
-    
+
     public InetAddressAndPort[] getStorageEndPoints(BigInteger token, Map<BigInteger, InetAddressAndPort> tokenToEndPointMap)
     {
         int startIndex = 0 ;

@@ -1,11 +1,9 @@
 package org.dist.kvstore
 
-import java.net.{InetSocketAddress, ServerSocket, Socket}
-import java.util
-import java.util.Map
+import java.net.{InetSocketAddress, ServerSocket}
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
-import java.util.concurrent.locks.{Condition, Lock, ReentrantLock}
+import java.util.concurrent.locks.ReentrantLock
 
 import org.dist.util.SocketIO
 import org.slf4j.LoggerFactory
@@ -13,15 +11,15 @@ import org.slf4j.LoggerFactory
 import scala.jdk.CollectionConverters._
 
 
-class StorageProxy(clientRequestIp: InetAddressAndPort, storageService: StorageService, messagingService:MessagingService) {
+class StorageProxy(clientRequestIp: InetAddressAndPort, storageService: StorageService, messagingService: MessagingService) {
 
   def start(): Unit = {
-      new TcpClientRequestListner(clientRequestIp, storageService, messagingService).start()
+    new TcpClientRequestListner(clientRequestIp, storageService, messagingService).start()
   }
 }
 
 
-class TcpClientRequestListner(localEp: InetAddressAndPort, storageService:StorageService, messagingService:MessagingService) extends Thread {
+class TcpClientRequestListner(localEp: InetAddressAndPort, storageService: StorageService, messagingService: MessagingService) extends Thread {
   private[kvstore] val logger = LoggerFactory.getLogger(classOf[TcpListener])
 
   override def run(): Unit = {
@@ -35,12 +33,12 @@ class TcpClientRequestListner(localEp: InetAddressAndPort, storageService:Storag
 
         logger.debug(s"Got client message ${message}")
 
-        if(message.header.verb == Verb.ROW_MUTATION) {
+        if (message.header.verb == Verb.ROW_MUTATION) {
           val response: Seq[Message] = new RowMutationHandler(storageService).handleMessage(message)
           val value: Seq[RowMutationResponse] = response.map(message => JsonSerDes.deserialize(message.payloadJson.getBytes, classOf[RowMutationResponse]))
           new Message(message.header, JsonSerDes.serialize(QuorumResponse(value.toList)))
 
-        } else if(message.header.verb == Verb.GET_CF) {
+        } else if (message.header.verb == Verb.GET_CF) {
           ""
 
         } else {
@@ -56,14 +54,15 @@ class TcpClientRequestListner(localEp: InetAddressAndPort, storageService:Storag
       val endpointMap = storageService.getNStorageEndPointMap(rowMutation.key)
 
       val quorumResponseHandler = new QuorumResponseHandler(endpointMap.values().size(), new WriteResponseResolver())
-           messagingService.sendRR(rowMutationMessage, endpointMap.values().asScala.toList, quorumResponseHandler)
+      messagingService.sendRR(rowMutationMessage, endpointMap.values().asScala.toList, quorumResponseHandler)
       quorumResponseHandler.get()
     }
   }
 
   trait ResponseResolver {
-    def resolve(messages:List[Message]):List[Message]
-    def isDataPresent(message:List[Message]):Boolean
+    def resolve(messages: List[Message]): List[Message]
+
+    def isDataPresent(message: List[Message]): Boolean
   }
 
   class WriteResponseResolver extends ResponseResolver {
@@ -74,11 +73,12 @@ class TcpClientRequestListner(localEp: InetAddressAndPort, storageService:Storag
     override def isDataPresent(message: List[Message]): Boolean = true
   }
 
-  class QuorumResponseHandler(responseCount:Int, resolver:ResponseResolver) extends MessageResponseHandler {
+  class QuorumResponseHandler(responseCount: Int, resolver: ResponseResolver) extends MessageResponseHandler {
     private val lock = new ReentrantLock
     private val condition = lock.newCondition()
     private val responses = new java.util.ArrayList[Message]()
     private val done = new AtomicBoolean(false)
+
     override def response(message: Message): Unit = {
       lock.lock()
       try {
@@ -92,11 +92,11 @@ class TcpClientRequestListner(localEp: InetAddressAndPort, storageService:Storag
           }
         }
       } finally {
-         lock.unlock()
+        lock.unlock()
       }
     }
 
-    def get():List[Message] = {
+    def get(): List[Message] = {
       val startTime = System.currentTimeMillis
       lock.lock()
       try {
@@ -111,9 +111,10 @@ class TcpClientRequestListner(localEp: InetAddressAndPort, storageService:Storag
 
       } finally {
         lock.unlock()
-        responses.forEach( m => messagingService.callbackMap.remove(m.header.id))
+        responses.forEach(m => messagingService.callbackMap.remove(m.header.id))
       }
       resolver.resolve(responses.asScala.toList)
     }
   }
+
 }
